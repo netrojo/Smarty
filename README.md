@@ -43,7 +43,7 @@ Edit `.env.local` with your Firebase project credentials:
 
 ```
 VITE_FIREBASE_API_KEY=your_api_key
-VITE_FIREBASE_DATABASE_URL=https://your-project-default-rtdb.firebaseio.com
+VITE_FIREBASE_DATABASE_URL=https://your-project-default-rtdb.us-central1.firebasedatabase.app
 VITE_FIREBASE_PROJECT_ID=your_project_id
 ```
 
@@ -88,48 +88,125 @@ Open **http://localhost:5173** — click a button, the ESP32 relay activates.
 
 ## ESP32 Setup
 
-Install the Firebase Arduino library on your ESP32 and subscribe to the relay paths:
+Install the current Firebase Arduino client library (`FirebaseClient` v2.x, by
+Firebase) and subscribe to the relay paths.
+
+### Command format
+
+`sendCommand()` does not write a bare number. It writes an **object**:
+
+```json
+{ "value": 1, "timestamp": 1758000000000 }
+```
+
+so the firmware must parse JSON and read `value`. Acknowledging a command means
+writing `{"value": 0}` back — **not** a bare `0`, which would discard the object
+shape the dashboard writes.
+
+### Security
+
+The web app uses no Firebase Authentication, so the Realtime Database must be
+readable and writable by anyone. That is fine for a bench test but means
+**anyone who knows the database URL can energise your relays**. Put it behind a
+non-guessable path, add Auth, or keep it off the public internet before leaving
+it unattended.
 
 ```cpp
-#include <Firebase_ESP_Client.h>
+#define ENABLE_DATABASE
+#define ENABLE_USER_AUTH
+#include <FirebaseClient.h>
+#include <ArduinoJson.h>
+#include <ExampleFunctions.h>  // provides SSL_CLIENT for the platform
 
-// Firebase config
-#define FIREBASE_HOST "your-project-default-rtdb.firebaseio.com"
-#define FIREBASE_AUTH "your_database_secret"
+// Use the *.firebasedatabase.app host. The legacy firebaseio.com name serves a
+// certificate for the other host, so TLS hostname verification fails.
+#define DATABASE_URL "your-project-default-rtdb.us-central1.firebasedatabase.app"
 
-FirebaseData fbdo;
+#define RELAY_1_PIN 26
+#define RELAY_2_PIN 27
+#define PULSE_MS 500
+
+SSL_CLIENT ssl_client, stream_ssl_client;
+AsyncClientClass aClient(ssl_client), streamClient(stream_ssl_client);
+NoAuth no_auth;  // open rules; see Security above
+FirebaseApp app;
+RealtimeDatabase Database;
+
+uint8_t pendingMask = 0, onMask = 0, ackMask = 0;
+unsigned long onSince = 0;
 
 void setup() {
-  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
-  Firebase.setStreamCallback(fbdo, streamCallback, streamTimeoutCallback);
+  pinMode(RELAY_1_PIN, OUTPUT);
+  pinMode(RELAY_2_PIN, OUTPUT);
+  digitalWrite(RELAY_1_PIN, LOW);
+  digitalWrite(RELAY_2_PIN, LOW);
 
-  // Listen for relay commands
-  Firebase.RTDB.beginStream(&fbdo, "/press1");
-  Firebase.RTDB.beginStream(&fbdo, "/press2");
+  ssl_client.setInsecure();
+  stream_ssl_client.setInsecure();
+  initializeApp(aClient, app, getAuth(no_auth));
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(DATABASE_URL);
+
+  // Stream the whole database from "/" so dataPath() is absolute (/press1).
+  // A stream rooted at "/press1" yields a relative path of "/", which makes it
+  // impossible to tell the relays apart. Streams must use streamClient.
+  Database.get(streamClient, "/", processData, true /* SSE mode */, "streamTask");
 }
 
 void loop() {
-  // Firebase stream runs in background
+  app.loop();  // maintains the async tasks
+  servicePulse();
 }
 
-void streamCallback(StreamData data) {
-  String path = data.dataPath();
-  int value = data.intData();
+void startPulse(uint8_t mask) {
+  onMask = mask;
+  onSince = millis();
+  if (onMask & 1) digitalWrite(RELAY_1_PIN, HIGH);
+  if (onMask & 2) digitalWrite(RELAY_2_PIN, HIGH);
+}
 
-  if (value == 1) {
-    if (path == "/press1") {
-      digitalWrite(RELAY_1_PIN, HIGH);
-      delay(500);
-      digitalWrite(RELAY_1_PIN, LOW);
-    }
-    if (path == "/press2") {
-      digitalWrite(RELAY_2_PIN, HIGH);
-      delay(500);
-      digitalWrite(RELAY_2_PIN, LOW);
-    }
-    // Reset the command in Firebase
-    Firebase.RTDB.setInt(&fbdo, path.c_str(), 0);
+// Pulses run from loop(), never from the stream callback: a delay() inside the
+// callback stalls the stream and drops concurrent commands.
+void servicePulse() {
+  if (onMask && millis() - onSince >= PULSE_MS) {
+    digitalWrite(RELAY_1_PIN, LOW);
+    digitalWrite(RELAY_2_PIN, LOW);
+    ackMask |= onMask;  // acknowledge only after the pulse finished
+    onMask = 0;
   }
+  if (pendingMask && !onMask) {
+    uint8_t m = pendingMask;
+    pendingMask = 0;
+    startPulse(m);
+  }
+  if (ackMask && !onMask && !pendingMask) {
+    uint8_t m = ackMask;
+    ackMask = 0;
+    JsonWriter writer;
+    object_t obj;
+    writer.create(obj, "value", 0);  // preserve the { value, timestamp } shape
+    if ((m & 1)) Database.set(aClient, "/press1", obj);
+    if ((m & 2)) Database.set(aClient, "/press2", obj);
+  }
+}
+
+void processData(AsyncResult &aResult) {
+  if (!aResult.isResult() || aResult.isError() || !aResult.available()) return;
+  RealtimeDatabaseResult &stream = aResult.to<RealtimeDatabaseResult>();
+  if (!stream.isStream()) return;
+  if (stream.type() != realtime_database_data_type_json) return;
+
+  String path = stream.dataPath();
+  if (path != "/press1" && path != "/press2") return;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, stream.to<const char *>()) != DeserializationError::Ok)
+    return;
+
+  JsonVariant value = doc["value"].as<JsonVariant>();
+  if (value.isNull() || !value.is<int>() || value.as<int>() != 1) return;
+
+  pendingMask |= (path == "/press1") ? 1 : 2;
 }
 ```
 
