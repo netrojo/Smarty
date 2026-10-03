@@ -37,8 +37,8 @@
     <text x="75" y="38" text-anchor="middle" fill="#7d8590" font-size="9">DevKit V1</text>
 
     <!-- GPIO pins -->
-    <text x="12" y="70" fill="#58a6ff" font-size="9">GPIO 26</text>
-    <text x="12" y="110" fill="#3fb950" font-size="9">GPIO 27</text>
+    <text x="12" y="70" fill="#58a6ff" font-size="9">GPIO 23</text>
+    <text x="12" y="110" fill="#3fb950" font-size="9">GPIO 22</text>
     <text x="12" y="150" fill="#7d8590" font-size="9">GND</text>
     <text x="12" y="188" fill="#f85149" font-size="9">5V (VIN)</text>
 
@@ -85,9 +85,9 @@
     <text x="60" y="168" fill="#e6edf3" font-size="9" transform="translate(0,0)">R1</text>
     <text x="60" y="178" fill="#7d8590" font-size="8">1kΩ ±5%</text>
 
-    <!-- GPIO26 wire to base -->
+    <!-- GPIO23 wire to base -->
     <path d="M 30 67 L 30 -20 L 67 -20" fill="none" stroke="#58a6ff" stroke-width="2" transform="translate(0,0)"/>
-    <text x="150" y="-15" fill="#58a6ff" font-size="8">GPIO 26</text>
+    <text x="150" y="-15" fill="#58a6ff" font-size="8">GPIO 23</text>
 
     <!-- Relay coil K1 (SRD-05VDC) -->
     <g transform="translate(210, 60)">
@@ -170,9 +170,9 @@
     <text x="60" y="185" fill="#e6edf3" font-size="9">R2</text>
     <text x="60" y="195" fill="#7d8590" font-size="8">1kΩ ±5%</text>
 
-    <!-- GPIO27 wire -->
+    <!-- GPIO22 wire -->
     <path d="M 30 107 L 30 -20 L 67 -20" fill="none" stroke="#3fb950" stroke-width="2" transform="translate(0,0)"/>
-    <text x="150" y="-15" fill="#3fb950" font-size="8" filter="url(#glow)">GPIO 27</text>
+    <text x="150" y="-15" fill="#3fb950" font-size="8" filter="url(#glow)">GPIO 22</text>
 
     <!-- Relay coil K2 -->
     <g transform="translate(210, 60)">

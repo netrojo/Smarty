@@ -63,8 +63,8 @@ Open **http://localhost:5173** — click a button, the ESP32 relay activates.
 
 | ESP32 Pin | Component | Signal |
 |-----------|-----------|--------|
-| GPIO 26   | R1 → Q1 base   | Relay 1 trigger (`press1`) |
-| GPIO 27   | R2 → Q2 base   | Relay 2 trigger (`press2`) |
+| GPIO 23   | R1 → Q1 base   | Relay 1 trigger (`press1`) |
+| GPIO 22   | R2 → Q2 base   | Relay 2 trigger (`press2`) |
 | GND       | Q1/Q2 emitter | Ground rail |
 | 5V (VIN)  | K1/K2 coil, D1/D2 | 5V power rail |
 
@@ -172,8 +172,8 @@ it unattended.
 #define DATABASE_URL "your-project-default-rtdb.region.firebasedatabase.app"
 
 // Relay pins
-#define RELAY_1_PIN 26
-#define RELAY_2_PIN 27
+#define RELAY_1_PIN 23
+#define RELAY_2_PIN 22
 
 #define PULSE_MS 500
 // How long the database value stays 1 before being reset to 0, measured from the
