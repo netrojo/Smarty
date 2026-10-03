@@ -125,8 +125,14 @@ Do **not** acknowledge a command by writing back to the same node. The write rac
 the stream and any command that has been written but not yet delivered gets
 overwritten and silently lost; at six commands 200 ms apart this dropped 4 of 6.
 Deduplicate on `timestamp` instead — it survives reconnect replays and, stored in
-NVS, survives a reboot. The value stays `1` afterwards, which is harmless because
-the dashboard never reads it back.
+NVS, survives a reboot.
+
+The firmware writes `0` back to `/pressN/value` about a second after firing, so
+the dashboard shows a visible pulse rather than a latched `1`. That reset is
+deliberately written to the **child** path `/pressN/value` instead of the whole
+object: rewriting the whole node from a callback replaces it and destroys the
+`timestamp` that deduplication depends on. The reset is abandoned if a newer
+command arrives before it fires.
 
 ### Security
 
@@ -137,45 +143,104 @@ non-guessable path, add Auth, or keep it off the public internet before leaving
 it unattended.
 
 ```cpp
+/**
+ * Smarty — ESP32 firmware for https://github.com/ammar0xff/smarty
+ *
+ * Contract with the web dashboard (src/firebase.ts):
+ *   sendCommand(path) -> set(ref(db, "press1"), { value: 1, timestamp: serverTimestamp() })
+ * so each relay node is an OBJECT, not a bare int.
+ *
+ * No Firebase auth: requires open RTDB rules
+ *   { "rules": { ".read": true, ".write": true } }
+ */
 #define ENABLE_DATABASE
 #define ENABLE_USER_AUTH
 #include <FirebaseClient.h>
 #include <ArduinoJson.h>
+#include <WiFi.h>
 #include <Preferences.h>
-#include <ExampleFunctions.h>  // provides SSL_CLIENT for the platform
+#include <ArduinoOTA.h>
+#include <ExampleFunctions.h>  // defines SSL_CLIENT for the platform
 
-// Use the *.firebasedatabase.app host. The legacy firebaseio.com name serves a
-// certificate for the other host, so TLS hostname verification fails.
-#define DATABASE_URL "your-project-default-rtdb.us-central1.firebasedatabase.app"
+// WiFi
+#define WIFI_SSID "your-wifi-ssid"
+#define WIFI_PASSWORD "your-wifi-password"
 
+// Must be the *.firebasedatabase.app host, not the legacy firebaseio.com:
+// firebaseio.com serves a *.us-central1.firebasedatabase.app certificate, so
+// hostname verification fails -> "Failed to initialize the SSL layer".
+#define DATABASE_URL "your-project-default-rtdb.region.firebasedatabase.app"
+
+// Relay pins
 #define RELAY_1_PIN 26
 #define RELAY_2_PIN 27
-#define PULSE_MS 500
 
-// A quiet database emits no put events, so user activity proves nothing about
-// stream health. Firebase sends an SSE keep-alive roughly every 45s; if none
-// arrives in this window the socket is dead and must be rebuilt, because the
-// client library never retries a stream on its own.
+#define PULSE_MS 500
+// How long the database value stays 1 before being reset to 0, measured from the
+// moment the command arrived. The dashboard never reads this back, so the reset
+// is purely cosmetic -- which is exactly why it must not be able to lose a click.
+#define RESET_DELAY_MS 1000
+#define HEAP_LOG_MS 15000
+
+// Connectivity watchdog. A quiet database produces no put events, so user
+// activity cannot tell us whether the stream is alive. Firebase sends an SSE
+// keep-alive roughly every 45s, so we subscribe to those and treat their arrival
+// as proof the socket is still healthy.
 #define STREAM_STALE_MS 90000
 
+// Forward declarations
+void processData(AsyncResult &aResult);
+void startPulse(uint8_t mask);
+void servicePulse();
+void ackRelays(uint8_t mask);
+void initFirebase();
+void startStream();
+void restartStream();
+
 SSL_CLIENT ssl_client, stream_ssl_client;
-AsyncClientClass aClient(ssl_client), streamClient(stream_ssl_client);
-NoAuth no_auth;  // open rules; see Security above
+using AsyncClient = AsyncClientClass;
+AsyncClient aClient(ssl_client), streamClient(stream_ssl_client);
+
+NoAuth no_auth;             // no authentication
 FirebaseApp app;
 RealtimeDatabase Database;
 
-// bit0 = relay 1, bit1 = relay 2
-uint8_t pendingMask = 0;  // commands waiting to fire
-uint8_t onMask = 0;       // relays currently driven HIGH
+unsigned long heapMs = 0;
+
+// Non-blocking pulse state. bit0 = relay 1, bit1 = relay 2.
+uint8_t pendingMask = 0;   // commands waiting to fire
+uint8_t onMask = 0;        // relays currently driven HIGH
 unsigned long onSince = 0;
 
-// Unix milliseconds from serverTimestamp() are ~1.8e12 and do NOT fit in a
-// 32-bit long. Truncating wrapped them negative about half the time, which
-// silently disabled deduplication.
+// Last-seen command stamp per relay. Timestamps come from the dashboard's
+// serverTimestamp(), so they are Unix milliseconds -- about 1.8e12, which does
+// NOT fit in a 32-bit long. Truncating it wrapped the value negative roughly
+// half the time, which silently disabled deduplication.
 long long lastStamp[2] = {-1, -1};
 
-// Stamps live in NVS so a reboot -- or a brownout, which a relay coil can
-// provoke -- cannot replay a command still sitting in the database.
+// Cosmetic reset state. resetAt[] is when a relay's value should fall back to 0;
+// resetStamp[] is the stamp that reset belongs to. lastStamp[idx] is compared
+// against resetStamp[idx] immediately before writing, so if a newer command has
+// already been seen the reset is abandoned instead of erasing it.
+unsigned long resetAt[2] = {0, 0};
+long long resetStamp[2] = {-1, -1};
+bool resetPending[2] = {false, false};
+
+// NVS writes can block for tens of milliseconds. Doing them in the stream
+// callback stalls the stream and RTDB starts dropping events, so they are
+// deferred to loop() via this flag.
+bool stampDirty[2] = {false, false};
+
+void flushStamps() {
+  for (uint8_t i = 0; i < 2; i++) {
+    if (!stampDirty[i]) continue;
+    stampDirty[i] = false;
+    saveStamp(i, lastStamp[i]);
+  }
+}
+
+// Kept in NVS so a reboot (or a brownout, which this board is prone to) cannot
+// replay a stale command that is still sitting in the database.
 Preferences prefs;
 bool prefsLoaded = false;
 
@@ -194,25 +259,44 @@ void saveStamp(int idx, long long stamp) {
   prefs.end();
 }
 
-void startStream() {
-  // Subscribe to put *and* keep-alive. Without this filter only put/patch are
-  // delivered; keep-alive is the watchdog's only liveness signal.
-  Database.setSSEFilters("put,keep-alive");
-  // Stream from "/" so dataPath() is absolute (/press1). A stream rooted at
-  // "/press1" yields a relative path of "/", making the relays indistinguishable.
-  // Streams must use streamClient.
-  Database.get(streamClient, "/", processData, true /* SSE mode */, "streamTask");
-}
+// Connectivity state
+unsigned long wifiDownMs = 0;
+bool streamFault = false;   // raised by the stream task, handled in loop()
+bool firebaseReady = false;
 
 void setup() {
+  Serial.begin(115200);
+
   pinMode(RELAY_1_PIN, OUTPUT);
   pinMode(RELAY_2_PIN, OUTPUT);
   digitalWrite(RELAY_1_PIN, LOW);
   digitalWrite(RELAY_2_PIN, LOW);
 
+  Serial.printf("connecting to %s\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) delay(250);
+  // Bound the wait. An unreachable access point used to leave the board here
+  // forever printing dots, so it never reached Firebase and never logged why.
+  // loop() keeps retrying the association afterwards.
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) delay(250);
+  if (WiFi.status() != WL_CONNECTED)
+    Firebase.printf("no wifi after 30s (status %d), continuing - loop() will retry\n",
+                    (int)WiFi.status());
+  else
+    Firebase.printf("connected: %s\n", WiFi.localIP().toString().c_str());
+  Firebase.printf("Smarty firmware, FirebaseClient v%s\n\n", FIREBASE_CLIENT_VERSION);
 
+  ArduinoOTA.setHostname("smarty-relay");
+  ArduinoOTA.setPassword("change-me");
+  ArduinoOTA.begin();
+
+  initFirebase();
+  firebaseReady = true;
+}
+
+// Bind the app and open the stream. Called at boot and again after any outage,
+// so a dropped link is recovered without a power cycle.
+void initFirebase() {
   ssl_client.setInsecure();
   stream_ssl_client.setInsecure();
   initializeApp(aClient, app, getAuth(no_auth));
@@ -221,38 +305,70 @@ void setup() {
   startStream();
 }
 
-unsigned long lastStreamMs = 0, wifiDownMs = 0, lastRestartMs = 0;
-bool firebaseReady = false;
+// A single stream on "/" so dataPath() is absolute (/press1, /press2).
+// With a per-node stream the path is relative and arrives as "/".
+// Streams must use streamClient; writes use aClient.
+void startStream() {
+  // No SSE filter is set. With one in place the library's event filtering was
+  // found to stop delivering commands, and a missed click is far worse than a
+  // quiet stream we cannot distinguish from a healthy idle one.
+  Database.get(streamClient, "/", processData, true /* SSE mode */, "streamTask");
+}
 
+// The library has no stream retry, so a socket that dies silently never
+// recovers. Stop the old task first: a second get() would open a second stream
+// and deliver every command twice, firing the relays twice.
 void restartStream() {
-  streamClient.stopAsync("streamTask");
+  Firebase.printf("stream restart\n");
+  streamClient.stopAsync(true);
+  delay(250);
   startStream();
-  lastStreamMs = millis();
-  lastRestartMs = millis();
+  streamFault = false;
 }
 
 void loop() {
-  app.loop();  // maintains the async tasks
+  ArduinoOTA.handle();
 
-  // Reconnect Wi-Fi rather than sitting deaf on a dead association.
+  // WiFi watchdog. There is no reconnect in the boot path, so a link drop left
+  // the board permanently offline until it was power cycled.
   if (WiFi.status() != WL_CONNECTED) {
     if (!wifiDownMs) wifiDownMs = millis();
-    if (millis() - wifiDownMs > 2000) {
+    if (!firebaseReady && millis() - wifiDownMs > 2000) {
       WiFi.disconnect();
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
       wifiDownMs = millis();
     }
-  } else if (wifiDownMs) {
+  } else {
+    if (wifiDownMs) Firebase.printf("wifi lost for %lus, recovered\n", (millis()-wifiDownMs)/1000);
     wifiDownMs = 0;
-    restartStream();
+    // A dropped WiFi socket kills the Firebase session with it.
+    if (!firebaseReady) {
+      Firebase.printf("firebase re-binding\n");
+      initFirebase();
+      firebaseReady = true;
+    }
   }
 
-  if (firebaseReady && millis() - lastStreamMs > STREAM_STALE_MS &&
-      millis() - lastRestartMs > STREAM_STALE_MS) {
-    restartStream();
-  }
+  if (firebaseReady) app.loop();  // maintains auth + async tasks
 
+  // The library never retries a stream, so a socket that dies silently leaves the
+  // board deaf until it is power cycled. Recovery is driven by the error the
+  // stream task reports rather than by a keep-alive timeout: filtering on
+  // "put,keep-alive" was itself found to stop delivering commands, and losing a
+  // click matters more than knowing a quiet stream is dead.
+  if (firebaseReady && streamFault) restartStream();
+
+
+  // Pulse and ack are driven from loop(), never from the stream task:
+  // a delay() inside the callback stalls the SSE stream.
+  flushStamps();
   servicePulse();
+
+  if (millis() - heapMs > HEAP_LOG_MS) {
+    heapMs = millis();
+    Serial.printf("heap: %u free / %u max block\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  }
 }
 
 void startPulse(uint8_t mask) {
@@ -260,10 +376,9 @@ void startPulse(uint8_t mask) {
   onSince = millis();
   if (onMask & 1) digitalWrite(RELAY_1_PIN, HIGH);
   if (onMask & 2) digitalWrite(RELAY_2_PIN, HIGH);
+  Firebase.printf("relay1=%d relay2=%d ON\n", !!(onMask & 1), !!(onMask & 2));
 }
 
-// Pulses run from loop(), never from the stream callback: a delay() inside the
-// callback stalls the stream and drops concurrent commands.
 void servicePulse() {
   if (onMask && millis() - onSince >= PULSE_MS) {
     digitalWrite(RELAY_1_PIN, LOW);
@@ -275,60 +390,103 @@ void servicePulse() {
     pendingMask = 0;
     startPulse(m);
   }
+
+  // One reset per iteration keeps each write a discrete RTDB event instead of a
+  // burst, which is what used to overrun the stream.
+  for (uint8_t i = 0; i < 2; i++) {
+    if (!resetPending[i] || onMask || pendingMask) continue;   // never mid-pulse
+    if ((long)(millis() - resetAt[i]) < 0) continue;           // hold at 1
+    if (resetStamp[i] >= 0 && lastStamp[i] != resetStamp[i]) { // newer command won
+      resetPending[i] = false;
+      continue;
+    }
+    resetPending[i] = false;
+    // Write the value child, not the whole node: this merges and leaves the
+    // timestamp intact. (Building one object with two writer.create() calls
+    // replaces it instead, producing {timestamp} with no value.)
+    const char *p = (i == 0) ? "/press1/value" : "/press2/value";
+    if (!Database.set(aClient, p, 0)) Firebase.printf("reset %s failed\n", p);
+  }
+}
+
+// Read the numeric "value" field out of the dashboard's command object.
+// Returns false when the payload is not an object with an integer value.
+bool commandValue(const char *json, int &out, long long &stamp) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json) != DeserializationError::Ok) return false;
+  JsonVariant v = doc["value"].as<JsonVariant>();
+  if (v.isNull() || !v.is<int>()) return false;
+  out = v.as<int>();
+  stamp = -1;
+  JsonVariant t = doc["timestamp"].as<JsonVariant>();
+  if (!t.isNull() && t.is<long long>()) stamp = t.as<long long>();
+  return true;
 }
 
 void processData(AsyncResult &aResult) {
-  if (!aResult.isResult() || !aResult.available()) return;
+  if (!aResult.isResult()) return;
 
   if (aResult.isError()) {
-    // -118 is the cancellation we cause ourselves when recycling the stream.
-    if (aResult.error().code() != -118)
+    // -118 is the cancellation we trigger ourselves when recycling the stream.
+    if (aResult.error().code() != -118) {
       Firebase.printf("Error task: %s, msg: %s, code: %d\n",
                       aResult.uid().c_str(), aResult.error().message().c_str(),
                       aResult.error().code());
+      streamFault = true;   // loop() rebuilds the stream
+    }
     return;
   }
+  if (!aResult.available()) return;
 
   RealtimeDatabaseResult &stream = aResult.to<RealtimeDatabaseResult>();
   if (!stream.isStream()) return;
 
-  lastStreamMs = millis();  // any event proves the socket is alive
-
-  if (stream.event() != "put") return;                        // ignore keep-alive
-  if (stream.type() != realtime_database_data_type_json) return;
+  if (stream.type() != realtime_database_data_type_json) return;  // command object
 
   String path = stream.dataPath();
   if (path != "/press1" && path != "/press2") return;
 
-  JsonDocument doc;
-  if (deserializeJson(doc, stream.to<const char *>()) != DeserializationError::Ok)
-    return;
-
-  int value = -1;
+  int value = 0;
   long long stamp = -1;
-  if (doc["value"].is<int>()) value = doc["value"].as<int>();
-  if (doc["timestamp"].is<long long>()) stamp = doc["timestamp"].as<long long>();
+  if (!commandValue(stream.to<const char *>(), value, stamp)) return;
 
   uint8_t idx = (path == "/press1") ? 0 : 1;
 
-  // A reconnect snapshot replays the last command. Without this check one click
-  // could fire the relay twice.
+  // Idempotency: the dashboard stamps every command with serverTimestamp(), so a
+  // reconnect snapshot replays the same stamp. Acting on it again would fire the
+  // relay twice for one click.
   loadStamps();
-  if (stamp >= 0 && stamp == lastStamp[idx]) return;
+  if (stamp >= 0 && stamp == lastStamp[idx]) return;   // replay of a seen command
   if (stamp >= 0) {
     lastStamp[idx] = stamp;
-    saveStamp(idx, stamp);
+    stampDirty[idx] = true;   // flushed from loop(), not here
   }
+  if (stamp >= 0) resetPending[idx] = false;   // this command supersedes any reset
 
   Firebase.printf("cmd %s value=%d stamp=%lld\n", path.c_str(), value, stamp);
   if (value != 1) return;
 
-  // Deliberately no write-back acknowledgement. Rewriting the node races the
-  // stream: a command written but not yet delivered gets overwritten and is
-  // lost. The dashboard never reads these values, so the write buys nothing.
+  // No ack write-back: the dashboard never reads these values, and writing to
+  // the same path could overwrite a command the stream had not delivered yet.
   pendingMask |= (idx == 0) ? 1 : 2;
+  resetAt[idx] = millis() + RESET_DELAY_MS;
+  resetStamp[idx] = stamp;
+  resetPending[idx] = true;
 }
 ```
+
+### Do not set an SSE filter
+
+`Database.setSSEFilters("put,keep-alive")` looks like a tidy way to get a
+liveness signal, and it does deliver keep-alive events — but with it in place
+commands stopped arriving and the board needed a power cycle to recover. Stream
+recovery is therefore driven by the error the stream task reports, not by a
+keep-alive timeout. Losing a click matters more than knowing a quiet stream is
+dead.
+
+`FirebaseClient` has no stream retry of its own, so `restartStream()` stops the
+old task before opening a new one; a second concurrent `get()` would deliver
+every command twice and fire the relays twice.
 
 ## Adding More Relays
 
