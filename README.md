@@ -152,6 +152,10 @@ it unattended.
  *
  * No Firebase auth: requires open RTDB rules
  *   { "rules": { ".read": true, ".write": true } }
+ *
+ * Threading: the stream callback runs on a FreeRTOS task and must not block.
+ * Everything with a delay in it (relay pulse, cosmetic value reset, NVS write)
+ * is deferred to loop() and driven by the flags set in processData().
  */
 #define ENABLE_DATABASE
 #define ENABLE_USER_AUTH
@@ -171,147 +175,269 @@ it unattended.
 // hostname verification fails -> "Failed to initialize the SSL layer".
 #define DATABASE_URL "your-project-default-rtdb.region.firebasedatabase.app"
 
-// Relay pins
-#define RELAY_1_PIN 23
-#define RELAY_2_PIN 22
+// --- Relay topology ---------------------------------------------------------
+// Adding a relay is a one-line change here: the count, the pin and the RTDB
+// path all follow from this table. Per-relay state, NVS keys and the value
+// reset path are derived from the index, so nothing else needs editing.
+constexpr uint8_t RELAY_COUNT = 2;
 
-#define PULSE_MS 500
+struct RelayConfig {
+  uint8_t pin;          // ESP32 output driving this relay's transistor
+  const char *path;     // RTDB node the dashboard writes to
+};
+
+constexpr RelayConfig RELAYS[RELAY_COUNT] = {
+    {23, "/press1"},
+    {22, "/press2"},
+};
+
+// How long the contacts are held closed.
+constexpr unsigned long PULSE_MS = 500;
+
 // How long the database value stays 1 before being reset to 0, measured from the
 // moment the command arrived. The dashboard never reads this back, so the reset
 // is purely cosmetic -- which is exactly why it must not be able to lose a click.
-#define RESET_DELAY_MS 1000
-#define HEAP_LOG_MS 15000
+constexpr unsigned long RESET_DELAY_MS = 1000;
 
-// Connectivity watchdog. A quiet database produces no put events, so user
-// activity cannot tell us whether the stream is alive. Firebase sends an SSE
-// keep-alive roughly every 45s, so we subscribe to those and treat their arrival
-// as proof the socket is still healthy.
-#define STREAM_STALE_MS 90000
+constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
+constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 2000;
+constexpr unsigned long HEAP_LOG_MS = 15000;
 
-// Forward declarations
-void processData(AsyncResult &aResult);
-void startPulse(uint8_t mask);
-void servicePulse();
-void ackRelays(uint8_t mask);
-void initFirebase();
-void startStream();
-void restartStream();
-
+// --- Firebase objects -------------------------------------------------------
 SSL_CLIENT ssl_client, stream_ssl_client;
 using AsyncClient = AsyncClientClass;
-AsyncClient aClient(ssl_client), streamClient(stream_ssl_client);
+AsyncClient aClient(ssl_client);        // writes
+AsyncClient streamClient(stream_ssl_client);  // the SSE stream
 
-NoAuth no_auth;             // no authentication
+NoAuth no_auth;
 FirebaseApp app;
 RealtimeDatabase Database;
 
-unsigned long heapMs = 0;
+// --- Per-relay runtime state ------------------------------------------------
+struct RelayState {
+  // Last accepted command stamp. Timestamps come from the dashboard's
+  // serverTimestamp(), so they are Unix milliseconds -- about 1.8e12, which does
+  // NOT fit in a 32-bit long. Truncating it wrapped the value negative roughly
+  // half the time, which silently disabled deduplication.
+  long long lastStamp = -1;
 
-// Non-blocking pulse state. bit0 = relay 1, bit1 = relay 2.
-uint8_t pendingMask = 0;   // commands waiting to fire
+  // Cosmetic reset, pending for one second after the command arrived.
+  long long resetStamp = -1;  // which stamp the reset belongs to
+  unsigned long resetAt = 0;  // millis() deadline
+  bool resetPending = false;
+
+  // NVS writes can block for tens of milliseconds. Doing them in the stream
+  // callback stalls the stream and RTDB starts dropping events, so the write is
+  // deferred to loop() via this flag.
+  bool stampDirty = false;
+};
+
+RelayState relays[RELAY_COUNT];
+
+// Pulse state, kept out of RelayState because a pulse is shared: overlapping
+// clicks are queued in pendingMask and fired one after another.
+uint8_t pendingMask = 0;   // clicks waiting to fire, bit0 = relay 1
 uint8_t onMask = 0;        // relays currently driven HIGH
 unsigned long onSince = 0;
 
-// Last-seen command stamp per relay. Timestamps come from the dashboard's
-// serverTimestamp(), so they are Unix milliseconds -- about 1.8e12, which does
-// NOT fit in a 32-bit long. Truncating it wrapped the value negative roughly
-// half the time, which silently disabled deduplication.
-long long lastStamp[2] = {-1, -1};
+// Connectivity
+unsigned long wifiDownMs = 0;
+bool streamFault = false;  // raised by the stream task, handled in loop()
+bool firebaseReady = false;
 
-// Cosmetic reset state. resetAt[] is when a relay's value should fall back to 0;
-// resetStamp[] is the stamp that reset belongs to. lastStamp[idx] is compared
-// against resetStamp[idx] immediately before writing, so if a newer command has
-// already been seen the reset is abandoned instead of erasing it.
-unsigned long resetAt[2] = {0, 0};
-long long resetStamp[2] = {-1, -1};
-bool resetPending[2] = {false, false};
+unsigned long heapMs = 0;
 
-// NVS writes can block for tens of milliseconds. Doing them in the stream
-// callback stalls the stream and RTDB starts dropping events, so they are
-// deferred to loop() via this flag.
-bool stampDirty[2] = {false, false};
+// --- Small helpers ----------------------------------------------------------
+
+// Wrap-safe "has this millis() deadline passed". millis() wraps every ~49 days
+// and a plain >= comparison breaks across the wrap; the signed difference does not.
+bool deadlinePassed(unsigned long now, unsigned long deadline) {
+  return (long)(now - deadline) >= 0;
+}
+
+// NVS key for a relay's dedup stamp. Kept as s1/s2 so existing stored stamps
+// stay valid -- changing the scheme would make a reboot replay a seen command.
+void stampKey(uint8_t idx, char *out, size_t n) {
+  snprintf(out, n, "s%u", (unsigned)idx + 1);
+}
+
+// NVS keeps the dedup stamps across a reboot (or a brownout, which this board is
+// prone to) so a stale command still sitting in the database cannot replay.
+Preferences prefs;
+
+void loadStamps() {
+  prefs.begin("smarty", true);
+  char key[8];
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    stampKey(i, key, sizeof key);
+    relays[i].lastStamp = prefs.getLong64(key, -1);
+  }
+  prefs.end();
+}
+
+void saveStamp(uint8_t idx, long long stamp) {
+  prefs.begin("smarty", false);
+  char key[8];
+  stampKey(idx, key, sizeof key);
+  prefs.putLong64(key, stamp);
+  prefs.end();
+}
 
 void flushStamps() {
-  for (uint8_t i = 0; i < 2; i++) {
-    if (!stampDirty[i]) continue;
-    stampDirty[i] = false;
-    saveStamp(i, lastStamp[i]);
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    if (!relays[i].stampDirty) continue;
+    relays[i].stampDirty = false;
+    saveStamp(i, relays[i].lastStamp);
   }
 }
 
-// Kept in NVS so a reboot (or a brownout, which this board is prone to) cannot
-// replay a stale command that is still sitting in the database.
-Preferences prefs;
-bool prefsLoaded = false;
-
-void loadStamps() {
-  if (prefsLoaded) return;
-  prefsLoaded = true;
-  prefs.begin("smarty", true);
-  lastStamp[0] = prefs.getLong64("s1", -1);
-  lastStamp[1] = prefs.getLong64("s2", -1);
-  prefs.end();
+// Returns the relay a command path belongs to, or -1 if we do not own it.
+int8_t relayIndexFor(const String &path) {
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    if (path == RELAYS[i].path) return i;
+  }
+  return -1;
 }
 
-void saveStamp(int idx, long long stamp) {
-  prefs.begin("smarty", false);
-  prefs.putLong64(idx == 0 ? "s1" : "s2", stamp);
-  prefs.end();
+// --- Contact pulse ----------------------------------------------------------
+
+void startPulse(uint8_t mask) {
+  onMask = mask;
+  onSince = millis();
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    if (onMask & (1 << i)) digitalWrite(RELAYS[i].pin, HIGH);
+  }
+  // Generic over RELAY_COUNT while keeping the exact "relay1=1 relay2=0 ON"
+  // shape the test scripts and any log scraper match on.
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    Firebase.printf("relay%d=%d%c", i + 1, !!(onMask & (1 << i)), ' ');
+  }
+  Firebase.printf("ON\n");
 }
 
-// Connectivity state
-unsigned long wifiDownMs = 0;
-bool streamFault = false;   // raised by the stream task, handled in loop()
-bool firebaseReady = false;
-
-void setup() {
-  Serial.begin(115200);
-
-  pinMode(RELAY_1_PIN, OUTPUT);
-  pinMode(RELAY_2_PIN, OUTPUT);
-  digitalWrite(RELAY_1_PIN, LOW);
-  digitalWrite(RELAY_2_PIN, LOW);
-
-  Serial.printf("connecting to %s\n", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  // Bound the wait. An unreachable access point used to leave the board here
-  // forever printing dots, so it never reached Firebase and never logged why.
-  // loop() keeps retrying the association afterwards.
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) delay(250);
-  if (WiFi.status() != WL_CONNECTED)
-    Firebase.printf("no wifi after 30s (status %d), continuing - loop() will retry\n",
-                    (int)WiFi.status());
-  else
-    Firebase.printf("connected: %s\n", WiFi.localIP().toString().c_str());
-  Firebase.printf("Smarty firmware, FirebaseClient v%s\n\n", FIREBASE_CLIENT_VERSION);
-
-  ArduinoOTA.setHostname("smarty-relay");
-  ArduinoOTA.setPassword("change-me");
-  ArduinoOTA.begin();
-
-  initFirebase();
-  firebaseReady = true;
+void servicePulse() {
+  if (onMask && deadlinePassed(millis(), onSince + PULSE_MS)) {
+    for (uint8_t i = 0; i < RELAY_COUNT; i++) digitalWrite(RELAYS[i].pin, LOW);
+    onMask = 0;
+  }
+  if (pendingMask && !onMask) {
+    uint8_t m = pendingMask;
+    pendingMask = 0;
+    startPulse(m);
+  }
 }
 
-// Bind the app and open the stream. Called at boot and again after any outage,
-// so a dropped link is recovered without a power cycle.
-void initFirebase() {
-  ssl_client.setInsecure();
-  stream_ssl_client.setInsecure();
-  initializeApp(aClient, app, getAuth(no_auth));
-  app.getApp<RealtimeDatabase>(Database);
-  Database.url(DATABASE_URL);
-  startStream();
+// --- Cosmetic value reset ---------------------------------------------------
+// Queued here, written from loop(): never from the stream callback, because the
+// write can block and a delay() in the callback stalls the SSE stream.
+void scheduleReset(uint8_t idx, long long stamp) {
+  relays[idx].resetStamp = stamp;
+  relays[idx].resetAt = millis() + RESET_DELAY_MS;
+  relays[idx].resetPending = true;
 }
+
+void serviceResets() {
+  // One reset per iteration keeps each write a discrete RTDB event instead of a
+  // burst, which is what used to overrun the stream.
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    RelayState &r = relays[i];
+    if (!r.resetPending || onMask || pendingMask) continue;  // never mid-pulse
+    if (!deadlinePassed(millis(), r.resetAt)) continue;       // hold at 1
+    r.resetPending = false;
+
+    // A newer command has since arrived; that one owns the value now.
+    if (r.resetStamp >= 0 && r.lastStamp != r.resetStamp) continue;
+
+    // Write the value child, not the whole node: this merges and leaves the
+    // timestamp intact. (Building one object with two writer.create() calls
+    // replaces it instead, producing {timestamp} with no value.)
+    char path[24];
+    snprintf(path, sizeof path, "%s/value", RELAYS[i].path);
+    if (!Database.set(aClient, path, 0)) Firebase.printf("reset %s failed\n", path);
+  }
+}
+
+// --- Command parsing --------------------------------------------------------
+
+// Read the numeric "value" out of the dashboard's command object. Returns false
+// when the payload is not an object with an integer value -- which is also how
+// keep-alive events and unrelated nodes are discarded.
+//
+// Out-params rather than a returned struct: the Arduino CLI injects generated
+// prototypes immediately after the last #include, so a user-defined type in a
+// signature would not be declared yet at that point.
+bool parseCommand(const char *json, int &value, long long &stamp) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json) != DeserializationError::Ok) return false;
+  JsonVariant v = doc["value"].as<JsonVariant>();
+  if (v.isNull() || !v.is<int>()) return false;
+  value = v.as<int>();
+  stamp = -1;
+  JsonVariant t = doc["timestamp"].as<JsonVariant>();
+  if (!t.isNull() && t.is<long long>()) stamp = t.as<long long>();
+  return true;
+}
+
+// --- Stream callback --------------------------------------------------------
+// Runs on the stream task. No delays, no NVS writes, no RTDB writes in here.
+
+void processData(AsyncResult &aResult) {
+  if (!aResult.isResult()) return;
+
+  if (aResult.isError()) {
+    // -118 is the cancellation we trigger ourselves when recycling the stream.
+    if (aResult.error().code() != -118) {
+      Firebase.printf("Error task: %s, msg: %s, code: %d\n",
+                      aResult.uid().c_str(), aResult.error().message().c_str(),
+                      aResult.error().code());
+      streamFault = true;  // loop() rebuilds the stream
+    }
+    return;
+  }
+  if (!aResult.available()) return;
+
+  RealtimeDatabaseResult &stream = aResult.to<RealtimeDatabaseResult>();
+  if (!stream.isStream()) return;
+  if (stream.type() != realtime_database_data_type_json) return;  // command object
+
+  String path = stream.dataPath();
+  int8_t idx = relayIndexFor(path);
+  if (idx < 0) return;
+
+  int value = 0;
+  long long stamp = -1;
+  if (!parseCommand(stream.to<const char *>(), value, stamp)) return;
+
+  RelayState &r = relays[idx];
+
+  // Idempotency: the dashboard stamps every command with serverTimestamp(), so a
+  // reconnect snapshot replays the same stamp. Acting on it again would fire the
+  // relay twice for one click.
+  if (stamp >= 0) {
+    if (stamp == r.lastStamp) return;  // replay of a command already seen
+    r.lastStamp = stamp;
+    r.stampDirty = true;  // written from loop(), not here
+    r.resetPending = false;  // this command supersedes any pending reset
+  }
+
+  Firebase.printf("cmd %s value=%d stamp=%lld\n", path.c_str(), value, stamp);
+
+  // No ack write-back: the dashboard never reads these values, and writing to
+  // the same path could overwrite a command the stream had not delivered yet.
+  if (value != 1) return;
+
+  pendingMask |= (1 << idx);
+  scheduleReset(idx, stamp);
+}
+
+// --- Connectivity -----------------------------------------------------------
 
 // A single stream on "/" so dataPath() is absolute (/press1, /press2).
 // With a per-node stream the path is relative and arrives as "/".
-// Streams must use streamClient; writes use aClient.
+// No SSE filter is set: with one in place the library's event filtering was found
+// to stop delivering commands, and a missed click is far worse than a quiet
+// stream we cannot distinguish from a healthy idle one.
 void startStream() {
-  // No SSE filter is set. With one in place the library's event filtering was
-  // found to stop delivering commands, and a missed click is far worse than a
-  // quiet stream we cannot distinguish from a healthy idle one.
   Database.get(streamClient, "/", processData, true /* SSE mode */, "streamTask");
 }
 
@@ -326,152 +452,98 @@ void restartStream() {
   streamFault = false;
 }
 
-void loop() {
-  ArduinoOTA.handle();
+// Bind the app and open the stream. Called at boot and again after any outage,
+// so a dropped link is recovered without a power cycle.
+void initFirebase() {
+  ssl_client.setInsecure();
+  stream_ssl_client.setInsecure();
+  initializeApp(aClient, app, getAuth(no_auth));
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(DATABASE_URL);
+  startStream();
+}
 
-  // WiFi watchdog. There is no reconnect in the boot path, so a link drop left
-  // the board permanently offline until it was power cycled.
+// There is no reconnect in the boot path, so a link drop left the board
+// permanently offline until it was power cycled. A dropped WiFi socket also kills
+// the Firebase session with it, so the app is re-bound on recovery.
+void serviceWifi() {
   if (WiFi.status() != WL_CONNECTED) {
     if (!wifiDownMs) wifiDownMs = millis();
-    if (!firebaseReady && millis() - wifiDownMs > 2000) {
+    if (!firebaseReady && deadlinePassed(millis(), wifiDownMs + WIFI_RETRY_INTERVAL_MS)) {
       WiFi.disconnect();
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
       wifiDownMs = millis();
     }
-  } else {
-    if (wifiDownMs) Firebase.printf("wifi lost for %lus, recovered\n", (millis()-wifiDownMs)/1000);
-    wifiDownMs = 0;
-    // A dropped WiFi socket kills the Firebase session with it.
-    if (!firebaseReady) {
-      Firebase.printf("firebase re-binding\n");
-      initFirebase();
-      firebaseReady = true;
-    }
+    return;
   }
 
+  if (wifiDownMs) {
+    Firebase.printf("wifi lost for %lus, recovered\n", (millis() - wifiDownMs) / 1000);
+    wifiDownMs = 0;
+  }
+  if (!firebaseReady) {
+    Firebase.printf("firebase re-binding\n");
+    initFirebase();
+    firebaseReady = true;
+  }
+}
+
+// --- Entry points -----------------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    pinMode(RELAYS[i].pin, OUTPUT);
+    digitalWrite(RELAYS[i].pin, LOW);
+  }
+
+  loadStamps();
+
+  Serial.printf("connecting to %s\n", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // Bound the wait. An unreachable access point used to leave the board here
+  // forever printing dots, so it never reached Firebase and never logged why.
+  // serviceWifi() keeps retrying the association afterwards.
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && !deadlinePassed(millis(), t0 + WIFI_CONNECT_TIMEOUT_MS)) {
+    delay(250);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Firebase.printf("no wifi after %lus (status %d), continuing - loop() will retry\n",
+                    WIFI_CONNECT_TIMEOUT_MS / 1000, (int)WiFi.status());
+  } else {
+    Firebase.printf("connected: %s\n", WiFi.localIP().toString().c_str());
+  }
+  Firebase.printf("Smarty firmware, FirebaseClient v%s\n\n", FIREBASE_CLIENT_VERSION);
+
+  ArduinoOTA.setHostname("smarty-relay");
+  ArduinoOTA.setPassword("change-me");
+  ArduinoOTA.begin();
+
+  initFirebase();
+  firebaseReady = true;
+}
+
+void loop() {
+  ArduinoOTA.handle();
+
+  serviceWifi();
   if (firebaseReady) app.loop();  // maintains auth + async tasks
 
-  // The library never retries a stream, so a socket that dies silently leaves the
-  // board deaf until it is power cycled. Recovery is driven by the error the
-  // stream task reports rather than by a keep-alive timeout: filtering on
-  // "put,keep-alive" was itself found to stop delivering commands, and losing a
-  // click matters more than knowing a quiet stream is dead.
+  // Recovery is driven by the error the stream task reports rather than by a
+  // keep-alive timeout, for the reason given on startStream().
   if (firebaseReady && streamFault) restartStream();
 
-
-  // Pulse and ack are driven from loop(), never from the stream task:
-  // a delay() inside the callback stalls the SSE stream.
   flushStamps();
   servicePulse();
+  serviceResets();
 
-  if (millis() - heapMs > HEAP_LOG_MS) {
+  if (deadlinePassed(millis(), heapMs + HEAP_LOG_MS)) {
     heapMs = millis();
     Serial.printf("heap: %u free / %u max block\n",
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   }
-}
-
-void startPulse(uint8_t mask) {
-  onMask = mask;
-  onSince = millis();
-  if (onMask & 1) digitalWrite(RELAY_1_PIN, HIGH);
-  if (onMask & 2) digitalWrite(RELAY_2_PIN, HIGH);
-  Firebase.printf("relay1=%d relay2=%d ON\n", !!(onMask & 1), !!(onMask & 2));
-}
-
-void servicePulse() {
-  if (onMask && millis() - onSince >= PULSE_MS) {
-    digitalWrite(RELAY_1_PIN, LOW);
-    digitalWrite(RELAY_2_PIN, LOW);
-    onMask = 0;
-  }
-  if (pendingMask && !onMask) {
-    uint8_t m = pendingMask;
-    pendingMask = 0;
-    startPulse(m);
-  }
-
-  // One reset per iteration keeps each write a discrete RTDB event instead of a
-  // burst, which is what used to overrun the stream.
-  for (uint8_t i = 0; i < 2; i++) {
-    if (!resetPending[i] || onMask || pendingMask) continue;   // never mid-pulse
-    if ((long)(millis() - resetAt[i]) < 0) continue;           // hold at 1
-    if (resetStamp[i] >= 0 && lastStamp[i] != resetStamp[i]) { // newer command won
-      resetPending[i] = false;
-      continue;
-    }
-    resetPending[i] = false;
-    // Write the value child, not the whole node: this merges and leaves the
-    // timestamp intact. (Building one object with two writer.create() calls
-    // replaces it instead, producing {timestamp} with no value.)
-    const char *p = (i == 0) ? "/press1/value" : "/press2/value";
-    if (!Database.set(aClient, p, 0)) Firebase.printf("reset %s failed\n", p);
-  }
-}
-
-// Read the numeric "value" field out of the dashboard's command object.
-// Returns false when the payload is not an object with an integer value.
-bool commandValue(const char *json, int &out, long long &stamp) {
-  JsonDocument doc;
-  if (deserializeJson(doc, json) != DeserializationError::Ok) return false;
-  JsonVariant v = doc["value"].as<JsonVariant>();
-  if (v.isNull() || !v.is<int>()) return false;
-  out = v.as<int>();
-  stamp = -1;
-  JsonVariant t = doc["timestamp"].as<JsonVariant>();
-  if (!t.isNull() && t.is<long long>()) stamp = t.as<long long>();
-  return true;
-}
-
-void processData(AsyncResult &aResult) {
-  if (!aResult.isResult()) return;
-
-  if (aResult.isError()) {
-    // -118 is the cancellation we trigger ourselves when recycling the stream.
-    if (aResult.error().code() != -118) {
-      Firebase.printf("Error task: %s, msg: %s, code: %d\n",
-                      aResult.uid().c_str(), aResult.error().message().c_str(),
-                      aResult.error().code());
-      streamFault = true;   // loop() rebuilds the stream
-    }
-    return;
-  }
-  if (!aResult.available()) return;
-
-  RealtimeDatabaseResult &stream = aResult.to<RealtimeDatabaseResult>();
-  if (!stream.isStream()) return;
-
-  if (stream.type() != realtime_database_data_type_json) return;  // command object
-
-  String path = stream.dataPath();
-  if (path != "/press1" && path != "/press2") return;
-
-  int value = 0;
-  long long stamp = -1;
-  if (!commandValue(stream.to<const char *>(), value, stamp)) return;
-
-  uint8_t idx = (path == "/press1") ? 0 : 1;
-
-  // Idempotency: the dashboard stamps every command with serverTimestamp(), so a
-  // reconnect snapshot replays the same stamp. Acting on it again would fire the
-  // relay twice for one click.
-  loadStamps();
-  if (stamp >= 0 && stamp == lastStamp[idx]) return;   // replay of a seen command
-  if (stamp >= 0) {
-    lastStamp[idx] = stamp;
-    stampDirty[idx] = true;   // flushed from loop(), not here
-  }
-  if (stamp >= 0) resetPending[idx] = false;   // this command supersedes any reset
-
-  Firebase.printf("cmd %s value=%d stamp=%lld\n", path.c_str(), value, stamp);
-  if (value != 1) return;
-
-  // No ack write-back: the dashboard never reads these values, and writing to
-  // the same path could overwrite a command the stream had not delivered yet.
-  pendingMask |= (idx == 0) ? 1 : 2;
-  resetAt[idx] = millis() + RESET_DELAY_MS;
-  resetStamp[idx] = stamp;
-  resetPending[idx] = true;
 }
 ```
 
@@ -501,6 +573,30 @@ const RELAYS: Relay[] = [
 ```
 
 The dashboard automatically renders cards for all relays in the array.
+
+On the firmware side, adding a relay is a single entry in the `RELAYS` table —
+per-relay state, the NVS key and the `/pressN/value` reset path are all derived
+from it:
+
+```cpp
+constexpr uint8_t RELAY_COUNT = 3;
+
+constexpr RelayConfig RELAYS[RELAY_COUNT] = {
+    {23, "/press1"},
+    {22, "/press2"},
+    {26, "/press3"},
+};
+```
+
+Bump `RELAY_COUNT` in the same edit. Nothing else needs changing.
+
+Two things to watch if you do this:
+
+- **Pin choice.** Avoid 34–39; they are input-only and have no output driver.
+- **NVS keys are positional.** A relay's dedup stamp is stored under `s1`, `s2`,
+  ... by index, so inserting a relay in the middle of the table re-points the
+  stored stamps at different relays and a reboot could replay a seen command.
+  Append new relays at the end.
 
 ## Commands
 
